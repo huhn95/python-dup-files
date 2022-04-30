@@ -4,7 +4,7 @@ import pathlib
 import hashlib
 import io
 import sqlite3
-
+import multiprocessing as mp
 
 # dir to start the check
 CHECK_DIR = 'files'
@@ -18,17 +18,72 @@ BUF_SIZE = io.DEFAULT_BUFFER_SIZE
 def db_connect():
     con = sqlite3.connect(SQL_LITE_DB)
     cur = con.cursor()
-    # cur.execute('''DROP TABLE files''')
+    #cur.execute('''DROP TABLE files''')
     cur.execute('''
     CREATE TABLE IF NOT EXISTS files (
         path TEXT PRIMARY KEY,
         hash varchar(128) NOT NULL,
-        modTime INTEGER
+        modTime INTEGER,
+        size INTEGER
     )
     ''')
     con.commit()
     return con
 
+def collect_files(start_dirs):
+    result = []
+    for dir in start_dirs:
+        if os.path.isfile(dir):
+            # oops dir is a file, add it to list
+            result.append(dir)
+            continue
+
+        # traverse root directory, and list directories as dirs and files as files
+        for basepath, _, files in os.walk(dir):
+            absPathsFiles = [os.path.abspath(os.path.join(basepath, f)) for f in files]
+            result.extend(absPathsFiles)
+            
+    return result
+        
+
+def scan_files(db_con, files):
+    db_cur = db_con.cursor()
+    db_to_update = []
+    for file_path in files:
+        # get file modification time
+        modTime = pathlib.Path(file_path).stat().st_mtime_ns
+        fileSize = pathlib.Path(file_path).stat().st_size
+        if fileSize == 0: continue 
+        # check if file has been checked already
+        db_res = db_cur.execute('SELECT modTime FROM files WHERE path = ?', (file_path, )).fetchone()
+        if db_res != None:
+            # check if file has been change since last scan
+            if modTime == db_res[0]: continue
+            print(f'file changed', end=' ')
+
+        print(f'{file_path}')     
+        # append to tuple to be updated
+        db_to_update.append((file_path,modTime, fileSize))
+    
+    return db_to_update    
+
+def add_hash2_update(f):
+    fHash = hash_file(f[0])
+    return (f[0], fHash, f[1], f[2], fHash, f[2])
+
+def update_db(db_con, updates_list):
+    with mp.Pool() as p:
+        db_updates = p.imap(add_hash2_update, updates_list, chunksize=10)
+
+        # store changes in database
+        db_cur = db_con.cursor()
+        db_cur.executemany('''
+            INSERT INTO files (path, hash, modTime, size) 
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET hash = ?, modTime = ?''', 
+            db_updates)
+
+        db_con.commit()
 
 def hash_file(fpath):
     sha512 = hashlib.sha512()
@@ -37,44 +92,8 @@ def hash_file(fpath):
             data = f.read(BUF_SIZE)
             if not data: break
             sha512.update(data)
-    return sha512.hexdigest()
+    return sha512.hexdigest()    
 
-def update_file(db_cur, file_path, modTime):
-    fHash = hash_file(file_path)
-    db_cur.execute('''
-        INSERT INTO files (path, hash, modTime) 
-        VALUES (?, ?, ?)
-        ON CONFLICT(path) DO UPDATE SET hash = ?, modTime = ?''', 
-        (file_path, fHash, modTime, fHash, modTime))
-
-
-def traverse_dir(db_con, start_dir):
-    db_cur = db_con.cursor()
-
-    # traverse root directory, and list directories as dirs and files as files
-    for root, _, files in os.walk(start_dir):
-        path = root.split(os.sep)
-        if path[-1].startswith('_'): continue
-
-        for file in files:
-            # absolute file path resolution
-            file_path = os.path.abspath(os.path.join(root, file))
-            # get file modification time
-            modTime = pathlib.Path(file_path).stat().st_mtime_ns 
-            # check if file has been checked already
-            db_res = db_cur.execute('SELECT modTime FROM files WHERE path = ?', (file_path, )).fetchone()
-            if db_res != None:
-                # check if file has been change since last scan
-                if modTime == db_res[0]: continue
-                print(f'file changed')
-
-            print(f'adding / updating db {file_path}')     
-            update_file(db_cur, file_path, modTime)
-    
-    # store changes in database
-    db_con.commit()
-
-    
 def get_duplicates(db_con):
     db_cur = db_con.cursor()
 
@@ -84,7 +103,7 @@ def get_duplicates(db_con):
     to_delete = []
     for row in hashes:
         file_dups = []
-        for dup_file in db_cur.execute('SELECT path, modTime FROM files WHERE hash = ?', (row[0], )):
+        for dup_file in db_cur.execute('SELECT path, modTime, size FROM files WHERE hash = ?', (row[0], )):
             if os.path.exists(dup_file[0]):
                 file_dups.append(dup_file)
             else:
@@ -101,14 +120,27 @@ def get_duplicates(db_con):
     db_con.commit()
     return duplicates_list
 
+def menu():
+    import argparse
+    parser = argparse.ArgumentParser(description='Duplicate file detection.')
+    parser.add_argument('startdirs', metavar='DIR', type=str, nargs='+',
+                    help='Directory to scan for duplicate files')
+    
+    return parser.parse_args()
 
 def main():
+    args = menu()
     # connect to database
     db_con = db_connect()
 
     # run through given dir
-    traverse_dir(db_con, CHECK_DIR)
+    files = collect_files(args.startdirs)
     
+    # actually scan for duplicate files
+    updates = scan_files(db_con, files)
+    # update database
+    update_db(db_con, updates)
+
     # create a list of duplicate files
     duplicates_list = get_duplicates(db_con)
 
@@ -116,7 +148,7 @@ def main():
     for row in duplicates_list:
         print(f'Found {len(row)} duplicates:')
         for dup_file in row:
-            print(f'\t{dup_file[0]} {dup_file[1]}')
+            print(f'\t{dup_file[0]}, modification: {dup_file[1]}, size: {dup_file[2]}')
     
     # close db connection
     db_con.close()
