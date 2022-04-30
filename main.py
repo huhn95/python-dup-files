@@ -2,7 +2,7 @@
 import os
 import pathlib
 import hashlib
-import collections
+import io
 import sqlite3
 
 
@@ -13,7 +13,7 @@ CHECK_DIR = 'files'
 SQL_LITE_DB = 'python-dup.db'
 
 # buffer size for file hashing
-BUF_SIZE = 65536
+BUF_SIZE = io.DEFAULT_BUFFER_SIZE
 
 def db_connect():
     con = sqlite3.connect(SQL_LITE_DB)
